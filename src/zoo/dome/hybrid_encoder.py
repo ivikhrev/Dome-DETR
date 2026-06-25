@@ -302,6 +302,7 @@ class HybridEncoder(nn.Module):
         self.defe_type = defe_type
         self.use_mwas = use_mwas
         self.mwas_window_size = mwas_window_size
+        self._deploy_mode = False
 
         # channel projection
         self.input_proj = nn.ModuleList()
@@ -324,13 +325,13 @@ class HybridEncoder(nn.Module):
                                                           dropout, enc_act, num_feature_levels, nhead, enc_n_points)
                 self.encoder = DeformableTransformerEncoder(
                     encoder_layer, num_encoder_layers,
-                    None, d_model=hidden_dim, 
+                    None, d_model=hidden_dim,
                     enc_layer_share=False,
                 )
                 self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, hidden_dim))
             else:
                 self.level_embed = None
-            
+
         else:
             if self.num_encoder_layers > 0:
                 encoder_layer = TransformerEncoderLayer(
@@ -419,16 +420,33 @@ class HybridEncoder(nn.Module):
                     ))
 
     @staticmethod
-    def build_2d_sincos_position_embedding(w, h, embed_dim=256, temperature=10000.0):
+    def build_2d_sincos_position_embedding(
+        w, h, embed_dim=256, temperature=10000.0, reference=None
+    ):
         """ """
-        grid_w = torch.arange(int(w), dtype=torch.float32)
-        grid_h = torch.arange(int(h), dtype=torch.float32)
+        if reference is None:
+            grid_w = torch.arange(int(w), dtype=torch.float32)
+            grid_h = torch.arange(int(h), dtype=torch.float32)
+        else:
+            reference_flat = reference.reshape(-1)
+            grid_w = (
+                torch.ones_like(reference_flat[: int(w)], dtype=torch.float32).cumsum(0) - 1
+            )
+            grid_h = (
+                torch.ones_like(reference_flat[: int(h)], dtype=torch.float32).cumsum(0) - 1
+            )
         grid_w, grid_h = torch.meshgrid(grid_w, grid_h, indexing="ij")
         assert (
             embed_dim % 4 == 0
         ), "Embed dimension must be divisible by 4 for 2D sin-cos position embedding"
         pos_dim = embed_dim // 4
-        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
+        if reference is None:
+            omega = torch.arange(pos_dim, dtype=torch.float32)
+        else:
+            omega = (
+                torch.ones_like(reference_flat[:pos_dim], dtype=torch.float32).cumsum(0) - 1
+            )
+        omega = omega / pos_dim
         omega = 1.0 / (temperature**omega)
 
         out_w = grid_w.flatten()[..., None] @ omega[None]
@@ -457,50 +475,96 @@ class HybridEncoder(nn.Module):
             restored_feats.append(feat)
             start_idx = end_idx
         return restored_feats
-    
 
-    def adaptive_defe_filter(self, defe_feature, init_thresh=0.05, step=0.01):
+    def convert_to_deploy(self):
+        self._deploy_mode = True
+
+    def _should_use_export_path(self):
+        return self._deploy_mode and (torch.onnx.is_in_onnx_export()  or torch.jit.is_tracing() or torch.compiler.is_exporting())
+
+    def adaptive_defe_filter_train(self, defe_feature, init_thresh=0.05, step=0.01):
         """
-        自适应调整阈值直到每个样本找到有效区域
-        Args:
-            defe_feature: 置信度特征图 [B, 1, H, W]
-            init_thresh: 初始阈值
-            step: 阈值调整步长
-        Returns:
-            defe_feature_filtered: 调整后的二值掩码 [B, 1, H, W]
+        保留训练/普通推理阶段的原始逐样本逻辑，避免改动正常模型行为。
         """
         B = defe_feature.shape[0]
-        device = defe_feature.device
         final_mask = torch.zeros_like(defe_feature, dtype=torch.bool)
-        
-        # 对每个样本独立处理
+
         for b in range(B):
-            # 提取单样本置信图 [1, H, W]
-            single_feat = defe_feature[b:b+1]
+            single_feat = defe_feature[b : b + 1]
             current_thresh = init_thresh
             found = False
-            
-            # 阈值搜索循环
+
             while current_thresh >= 0:
-                mask = (single_feat > current_thresh)
+                mask = single_feat > current_thresh
                 if mask.any():
-                    final_mask[b:b+1] = mask
+                    final_mask[b : b + 1] = mask
                     found = True
                     break
                 current_thresh = round(current_thresh - step, 2)
-            
-            # 未找到有效区域则随机选择一个点加强
+
             if not found:
-                final_mask[b:b+1] = torch.zeros_like(single_feat, dtype=torch.bool)
-                final_mask[b:b+1][:, random.randint(0, single_feat.shape[1] - 1), random.randint(0, single_feat.shape[2] - 1)] = True
+                final_mask[b : b + 1] = torch.zeros_like(single_feat, dtype=torch.bool)
+                rand_h = random.randint(0, single_feat.shape[2] - 1)
+                rand_w = random.randint(0, single_feat.shape[3] - 1)
+                final_mask[b, :, rand_h, rand_w] = True
                 print(f"Batch {b}: No valid region found, use random point enhancement")
-        
+
         return final_mask
+
+    def adaptive_defe_filter_export(self, defe_feature, init_thresh=0.05, step=0.01):
+        """
+        导出阶段使用纯张量实现，避免 Python 控制流进入 ONNX 图。
+        """
+        max_vals = defe_feature.flatten(2).amax(dim=-1, keepdim=True)
+        eps = torch.finfo(defe_feature.dtype).eps
+        thresholds = torch.floor((max_vals - eps) / step) * step
+        thresholds = thresholds.clamp(min=0.0, max=init_thresh)
+        final_mask = defe_feature > thresholds.unsqueeze(-1)
+
+        # The density map is produced by a sigmoid head, so empty masks are
+        # extremely rare. Keep the original fallback semantics, but express it
+        # without data-dependent control flow so tracing remains sample-agnostic.
+        B, _, H, W = defe_feature.shape
+        final_mask_flat = final_mask.flatten(2)
+        empty_mask = ~final_mask_flat.any(dim=-1, keepdim=True)
+        flat_indices = defe_feature.flatten(2).argmax(dim=-1, keepdim=True)
+        # Build indices from an input-derived tensor. Exporting on CPU records
+        # the device of torch.arange as a constant, which later breaks when the
+        # TorchScript/ExportedProgram model is moved to CUDA.
+        positions = torch.ones_like(final_mask_flat, dtype=torch.int64).cumsum(dim=-1) - 1
+        fallback_flat = positions == flat_indices
+        final_mask_flat = torch.logical_or(
+            torch.logical_and(empty_mask, fallback_flat),
+            torch.logical_and(torch.logical_not(empty_mask), final_mask_flat),
+        )
+
+        return final_mask_flat.view(B, 1, H, W)
+
+    def adaptive_defe_filter(self, defe_feature, init_thresh=0.05, step=0.01):
+        if self._should_use_export_path():
+            return self.adaptive_defe_filter_export(defe_feature, init_thresh, step)
+        return self.adaptive_defe_filter_train(defe_feature, init_thresh, step)
+
+    def pool_density_map(self, defe_feature, feat_hw):
+        feat_h, feat_w = feat_hw
+        target_size = (feat_h // self.mwas_window_size, feat_w // self.mwas_window_size)
+        if self._should_use_export_path():
+            pool_kernel = self.feat_strides[1] * self.mwas_window_size
+            if (
+                defe_feature.shape[-2] % pool_kernel == 0
+                and defe_feature.shape[-1] % pool_kernel == 0
+            ):
+                return F.max_pool2d(
+                    defe_feature,
+                    kernel_size=pool_kernel,
+                    stride=pool_kernel,
+                )
+        return F.adaptive_max_pool2d(defe_feature, target_size)
 
 
     def forward(self, feats, img_inputs, targets=None):
         out = {"img_inputs": img_inputs}
-        
+
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
 
@@ -513,14 +577,25 @@ class HybridEncoder(nn.Module):
             defe_feature, reg_value = self.DeFE(proj_feats[0])
             W, H = proj_feats[1].shape[2:]
             out["defe"] = {"reg_value": reg_value, "density_map": defe_feature}
-            defe_feature_pooled = F.adaptive_max_pool2d(defe_feature, (H // self.mwas_window_size, W // self.mwas_window_size))
+            defe_feature_pooled = self.pool_density_map(defe_feature, proj_feats[1].shape[2:])
             out["defe"]["defe_feature"] = defe_feature
             out["defe"]["density_map_pooled"] = defe_feature_pooled
             if self.use_mwas:
                 W, H = proj_feats[1].shape[2:]
                 defe_feature_filtered = self.adaptive_defe_filter(F.interpolate(defe_feature_pooled, size=(H, W), mode="bilinear", align_corners=True)).float()
-                glob_pos_embed = self.build_2d_sincos_position_embedding(W, H, embed_dim=self.hidden_dim).permute(0, 2, 1).view(-1, H, W).to(proj_feats[1].device)
-                enhanced_memory, defe_window_mask = self.mwas_processor(proj_feats[1], defe_feature_filtered, self.mwas_window_size, glob_pos_embed)
+                glob_pos_embed = self.build_2d_sincos_position_embedding(
+                    W,
+                    H,
+                    embed_dim=self.hidden_dim,
+                    reference=proj_feats[1],
+                ).permute(0, 2, 1).view(-1, H, W)
+                enhanced_memory, defe_window_mask = self.mwas_processor(
+                    proj_feats[1],
+                    defe_feature_filtered,
+                    self.mwas_window_size,
+                    glob_pos_embed,
+                    self.feat_strides[1],
+                )
                 proj_feats[1] = enhanced_memory
                 out["defe"]["defe_window_mask"] = defe_window_mask
                 if SAVE_INTERMEDIATE_VISUALIZE_RESULT:
@@ -569,12 +644,13 @@ class HybridEncoder(nn.Module):
                     spatial_shapes.append(spatial_shape)
 
                     # generate mask and pos_embed
-                    if self.training or self.eval_spatial_size is None:
-                        pos_embed = self.build_2d_sincos_position_embedding(
-                            w, h, self.hidden_dim, self.pe_temperature
-                        ).to(src.device)
-                    else:
-                        pos_embed = self.pos_embeds[lvl].to(src.device)
+                    pos_embed = self.build_2d_sincos_position_embedding(
+                        w,
+                        h,
+                        self.hidden_dim,
+                        self.pe_temperature,
+                        reference=src,
+                    )
 
                     # generate all False mask which shape is （bs, hw)
                     mask = torch.zeros((bs, h, w), dtype=torch.bool, device=src.device)
@@ -588,10 +664,10 @@ class HybridEncoder(nn.Module):
                     lvl_pos_embed_flatten.append(lvl_pos_embed)
                     src_flatten.append(src)
                     mask_flatten.append(mask)
-                
-                src_flatten = torch.cat(src_flatten, 1)    # bs, \sum{hxw}, c 
+
+                src_flatten = torch.cat(src_flatten, 1)    # bs, \sum{hxw}, c
                 mask_flatten = torch.cat(mask_flatten, 1)   # bs, \sum{hxw}
-                lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1) # bs, \sum{hxw}, c 
+                lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1) # bs, \sum{hxw}, c
                 spatial_shapes_tensor = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
                 level_start_index = torch.cat((spatial_shapes_tensor.new_zeros((1, )), spatial_shapes_tensor.prod(1).cumsum(0)[:-1]))
                 valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
@@ -601,7 +677,7 @@ class HybridEncoder(nn.Module):
                     visualize_src_flatten(src_flatten=src_flatten, spatial_shapes=spatial_shapes, savename="encoder_input")
 
                 memory, enc_intermediate_output = self.encoder(
-                    src_flatten, 
+                    src_flatten,
                     pos=lvl_pos_embed_flatten,
                     spatial_shapes=spatial_shapes_tensor,
                     level_start_index=level_start_index,
@@ -620,17 +696,18 @@ class HybridEncoder(nn.Module):
                     h, w = proj_feats[enc_ind].shape[2:]
                     # flatten [B, C, H, W] to [B, HxW, C]
                     src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)
-                    if self.training or self.eval_spatial_size is None:
-                        pos_embed = self.build_2d_sincos_position_embedding(
-                            w, h, self.hidden_dim, self.pe_temperature
-                        ).to(src_flatten.device)
-                    else:
-                        pos_embed = self.pos_embeds[i].to(src_flatten.device)
+                    pos_embed = self.build_2d_sincos_position_embedding(
+                        w,
+                        h,
+                        self.hidden_dim,
+                        self.pe_temperature,
+                        reference=src_flatten,
+                    )
                     memory: torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
                     proj_feats[enc_ind] = (
                         memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
                     )
-        
+
         if self.use_hybrid:
             # broadcasting and fusion
             inner_outs = [proj_feats[-1]]
