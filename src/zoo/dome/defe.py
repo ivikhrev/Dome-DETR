@@ -120,7 +120,7 @@ class LiteDeFE(nn.Module):
         )
 
         # Normalize with tensor ops so export does not depend on Python control flow.
-        density_max = density.amax()
+        density_max = density.flatten().amax(dim=0)
         density = torch.where(density_max > 0, density / density_max, density)
 
         reg_value = self.regression_head(x)

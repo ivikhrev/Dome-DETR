@@ -325,13 +325,13 @@ class HybridEncoder(nn.Module):
                                                           dropout, enc_act, num_feature_levels, nhead, enc_n_points)
                 self.encoder = DeformableTransformerEncoder(
                     encoder_layer, num_encoder_layers,
-                    None, d_model=hidden_dim, 
+                    None, d_model=hidden_dim,
                     enc_layer_share=False,
                 )
                 self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, hidden_dim))
             else:
                 self.level_embed = None
-            
+
         else:
             if self.num_encoder_layers > 0:
                 encoder_layer = TransformerEncoderLayer(
@@ -420,16 +420,33 @@ class HybridEncoder(nn.Module):
                     ))
 
     @staticmethod
-    def build_2d_sincos_position_embedding(w, h, embed_dim=256, temperature=10000.0):
+    def build_2d_sincos_position_embedding(
+        w, h, embed_dim=256, temperature=10000.0, reference=None
+    ):
         """ """
-        grid_w = torch.arange(int(w), dtype=torch.float32)
-        grid_h = torch.arange(int(h), dtype=torch.float32)
+        if reference is None:
+            grid_w = torch.arange(int(w), dtype=torch.float32)
+            grid_h = torch.arange(int(h), dtype=torch.float32)
+        else:
+            reference_flat = reference.reshape(-1)
+            grid_w = (
+                torch.ones_like(reference_flat[: int(w)], dtype=torch.float32).cumsum(0) - 1
+            )
+            grid_h = (
+                torch.ones_like(reference_flat[: int(h)], dtype=torch.float32).cumsum(0) - 1
+            )
         grid_w, grid_h = torch.meshgrid(grid_w, grid_h, indexing="ij")
         assert (
             embed_dim % 4 == 0
         ), "Embed dimension must be divisible by 4 for 2D sin-cos position embedding"
         pos_dim = embed_dim // 4
-        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
+        if reference is None:
+            omega = torch.arange(pos_dim, dtype=torch.float32)
+        else:
+            omega = (
+                torch.ones_like(reference_flat[:pos_dim], dtype=torch.float32).cumsum(0) - 1
+            )
+        omega = omega / pos_dim
         omega = 1.0 / (temperature**omega)
 
         out_w = grid_w.flatten()[..., None] @ omega[None]
@@ -463,7 +480,7 @@ class HybridEncoder(nn.Module):
         self._deploy_mode = True
 
     def _should_use_export_path(self):
-        return self._deploy_mode and torch.onnx.is_in_onnx_export()
+        return self._deploy_mode and (torch.onnx.is_in_onnx_export()  or torch.jit.is_tracing() or torch.compiler.is_exporting())
 
     def adaptive_defe_filter_train(self, defe_feature, init_thresh=0.05, step=0.01):
         """
@@ -511,7 +528,10 @@ class HybridEncoder(nn.Module):
         final_mask_flat = final_mask.flatten(2)
         empty_mask = ~final_mask_flat.any(dim=-1, keepdim=True)
         flat_indices = defe_feature.flatten(2).argmax(dim=-1, keepdim=True)
-        positions = torch.arange(H * W, device=defe_feature.device).view(1, 1, -1)
+        # Build indices from an input-derived tensor. Exporting on CPU records
+        # the device of torch.arange as a constant, which later breaks when the
+        # TorchScript/ExportedProgram model is moved to CUDA.
+        positions = torch.ones_like(final_mask_flat, dtype=torch.int64).cumsum(dim=-1) - 1
         fallback_flat = positions == flat_indices
         final_mask_flat = torch.logical_or(
             torch.logical_and(empty_mask, fallback_flat),
@@ -544,7 +564,7 @@ class HybridEncoder(nn.Module):
 
     def forward(self, feats, img_inputs, targets=None):
         out = {"img_inputs": img_inputs}
-        
+
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
 
@@ -563,7 +583,12 @@ class HybridEncoder(nn.Module):
             if self.use_mwas:
                 W, H = proj_feats[1].shape[2:]
                 defe_feature_filtered = self.adaptive_defe_filter(F.interpolate(defe_feature_pooled, size=(H, W), mode="bilinear", align_corners=True)).float()
-                glob_pos_embed = self.build_2d_sincos_position_embedding(W, H, embed_dim=self.hidden_dim).permute(0, 2, 1).view(-1, H, W).to(proj_feats[1].device)
+                glob_pos_embed = self.build_2d_sincos_position_embedding(
+                    W,
+                    H,
+                    embed_dim=self.hidden_dim,
+                    reference=proj_feats[1],
+                ).permute(0, 2, 1).view(-1, H, W)
                 enhanced_memory, defe_window_mask = self.mwas_processor(
                     proj_feats[1],
                     defe_feature_filtered,
@@ -619,12 +644,13 @@ class HybridEncoder(nn.Module):
                     spatial_shapes.append(spatial_shape)
 
                     # generate mask and pos_embed
-                    if self.training or self.eval_spatial_size is None:
-                        pos_embed = self.build_2d_sincos_position_embedding(
-                            w, h, self.hidden_dim, self.pe_temperature
-                        ).to(src.device)
-                    else:
-                        pos_embed = self.pos_embeds[lvl].to(src.device)
+                    pos_embed = self.build_2d_sincos_position_embedding(
+                        w,
+                        h,
+                        self.hidden_dim,
+                        self.pe_temperature,
+                        reference=src,
+                    )
 
                     # generate all False mask which shape is （bs, hw)
                     mask = torch.zeros((bs, h, w), dtype=torch.bool, device=src.device)
@@ -638,10 +664,10 @@ class HybridEncoder(nn.Module):
                     lvl_pos_embed_flatten.append(lvl_pos_embed)
                     src_flatten.append(src)
                     mask_flatten.append(mask)
-                
-                src_flatten = torch.cat(src_flatten, 1)    # bs, \sum{hxw}, c 
+
+                src_flatten = torch.cat(src_flatten, 1)    # bs, \sum{hxw}, c
                 mask_flatten = torch.cat(mask_flatten, 1)   # bs, \sum{hxw}
-                lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1) # bs, \sum{hxw}, c 
+                lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1) # bs, \sum{hxw}, c
                 spatial_shapes_tensor = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
                 level_start_index = torch.cat((spatial_shapes_tensor.new_zeros((1, )), spatial_shapes_tensor.prod(1).cumsum(0)[:-1]))
                 valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
@@ -651,7 +677,7 @@ class HybridEncoder(nn.Module):
                     visualize_src_flatten(src_flatten=src_flatten, spatial_shapes=spatial_shapes, savename="encoder_input")
 
                 memory, enc_intermediate_output = self.encoder(
-                    src_flatten, 
+                    src_flatten,
                     pos=lvl_pos_embed_flatten,
                     spatial_shapes=spatial_shapes_tensor,
                     level_start_index=level_start_index,
@@ -670,17 +696,18 @@ class HybridEncoder(nn.Module):
                     h, w = proj_feats[enc_ind].shape[2:]
                     # flatten [B, C, H, W] to [B, HxW, C]
                     src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)
-                    if self.training or self.eval_spatial_size is None:
-                        pos_embed = self.build_2d_sincos_position_embedding(
-                            w, h, self.hidden_dim, self.pe_temperature
-                        ).to(src_flatten.device)
-                    else:
-                        pos_embed = self.pos_embeds[i].to(src_flatten.device)
+                    pos_embed = self.build_2d_sincos_position_embedding(
+                        w,
+                        h,
+                        self.hidden_dim,
+                        self.pe_temperature,
+                        reference=src_flatten,
+                    )
                     memory: torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
                     proj_feats[enc_ind] = (
                         memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
                     )
-        
+
         if self.use_hybrid:
             # broadcasting and fusion
             inner_outs = [proj_feats[-1]]

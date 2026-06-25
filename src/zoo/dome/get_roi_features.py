@@ -9,7 +9,7 @@ from skimage.measure import label, regionprops
 from tools.visualize_src_flatten import visualize_src_flatten
 import numpy as np
 from .utils import get_activation
-import torch.nn as nn   
+import torch.nn as nn
 import os
 import copy
 
@@ -83,7 +83,7 @@ class TransformerEncoder(nn.Module):
             output = self.norm(output)
 
         return output
-    
+
 
 # transformer
 class AxisPermutedEncoderLayer(nn.Module):
@@ -136,7 +136,7 @@ class AxisPermutedEncoderLayer(nn.Module):
         if not self.normalize_before:
             src = self.norm2(src)
         return src
-    
+
 
 class AxisPermutedEncoder(nn.Module):
     def __init__(self, encoder_layer, num_layers, norm=None):
@@ -167,7 +167,7 @@ class AxisPermutedEncoder(nn.Module):
             output = self.norm(output)
 
         return output
-        
+
 
 
 class WindowProcessor(nn.Module):
@@ -181,7 +181,7 @@ class WindowProcessor(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_layers = num_layers
-        
+
         # 相对位置编码器
         self.rel_pos_encoder = nn.Sequential(
             nn.Linear(2, 64),
@@ -201,7 +201,7 @@ class WindowProcessor(nn.Module):
 
     @staticmethod
     def _should_use_export_path():
-        return torch.onnx.is_in_onnx_export()
+        return torch.onnx.is_in_onnx_export() or torch.jit.is_tracing() or torch.compiler.is_exporting()
 
     def forward(self, backbone_memory, defe_feature_filtered, window_size, glob_pos_embed, mask_stride=None):
         if self._should_use_export_path():
@@ -224,7 +224,7 @@ class WindowProcessor(nn.Module):
         前向传播
         Args:
             backbone_memory: 原特征图 [B, C, H, W]
-            defe_feature_filtered: 二值图 [B, 1, H, W] 
+            defe_feature_filtered: 二值图 [B, 1, H, W]
             window_size: 窗口大小 (像素/特征点数)
             feature_enhancer: 可选的特征增强模块
         """
@@ -232,11 +232,13 @@ class WindowProcessor(nn.Module):
         B, C, H, W = backbone_memory.shape
 
         assert H % window_size == 0 and W % window_size == 0, "H and W must be divisible by window_size"
-        
+
         num_win_h = H // window_size
         num_win_w = W // window_size
 
-        rel_pos_embed = self._get_rel_embedding((window_size, window_size)).to(backbone_memory.device)
+        rel_pos_embed = self._get_rel_embedding(
+            (window_size, window_size), backbone_memory
+        )
 
         reconstructed = backbone_memory.clone()
         windows, defe_mask = self._prepare_windows(backbone_memory, defe_feature_filtered, window_size)
@@ -288,7 +290,9 @@ class WindowProcessor(nn.Module):
         num_win_h = H // window_size
         num_win_w = W // window_size
 
-        rel_pos_embed = self._get_rel_embedding((window_size, window_size)).to(backbone_memory.device)
+        rel_pos_embed = self._get_rel_embedding(
+            (window_size, window_size), backbone_memory
+        )
 
         windows, defe_mask = self._prepare_windows_export(
             backbone_memory,
@@ -410,24 +414,24 @@ class WindowProcessor(nn.Module):
         """处理窗口特征并添加位置编码"""
         batch_features = []
         batch_glob_pos_embed = []
-        
+
         # Grid dimensions based on window_size
         num_win_h = H // window_size
         num_win_w = W // window_size
-        
+
         for i, j in valid_indices:
             # 原始窗口特征 [C, h, w]
             win_feat = windows[i, j]
-            
+
             # 拼接特征和位置编码
             combined = win_feat
-            
+
             batch_features.append(combined.unsqueeze(0))
             batch_glob_pos_embed.append(self._get_abs_embedding(glob_pos_embed, i, j, window_size, window_size))
-        
+
         return torch.cat(batch_features, dim=0), torch.stack(batch_glob_pos_embed)  # [N, C]
 
-    
+
     def _encode_features(self, features, rel_pos_embed, glob_pos_embeds):
         """三层编码处理"""
         # 调整维度 [N, C+D, h, w] -> [N, L, C+D]
@@ -435,7 +439,7 @@ class WindowProcessor(nn.Module):
         features = features.view(B, C, -1).permute(0, 2, 1)
 
         features = self.window_encoder(features, pos_embed=rel_pos_embed, glob_pos_embeds=glob_pos_embeds)
-            
+
         # 恢复空间维度
         return features.permute(0, 2, 1).view(B, C, h, w)
 
@@ -446,7 +450,7 @@ class WindowProcessor(nn.Module):
             h_end = h_start + win_h
             w_start = j * win_w
             w_end = w_start + win_w
-            
+
             reconstructed[batch_idx, :, h_start:h_end, w_start:w_end] += feats[idx]
 
     def _get_abs_embedding(self, global_emb, i, j, win_h, win_w):
@@ -455,14 +459,19 @@ class WindowProcessor(nn.Module):
         y0 = i * win_h
         return global_emb[:, y0:y0+win_h, x0:x0+win_w]  # [256, win_h, win_w]
 
-    def _get_rel_embedding(self, window_size):
+    def _get_rel_embedding(self, window_size, reference=None):
         """相对位置编码"""
         h, w = window_size
-        coords = self._get_relative_coords(h, w)
-        return self.rel_pos_encoder(coords.to(self.rel_pos_encoder[0].weight.device)).permute(2,0,1)
+        if reference is None:
+            reference = self.rel_pos_encoder[0].weight
+        coords = self._get_relative_coords(h, w, reference)
+        return self.rel_pos_encoder(coords).permute(2,0,1)
 
     @staticmethod
-    def _get_relative_coords(h, w):
+    def _get_relative_coords(h, w, reference):
         """生成归一化坐标矩阵"""
-        grid_y, grid_x = torch.meshgrid(torch.arange(h), torch.arange(w))
+        reference_flat = reference.reshape(-1)
+        grid_y = torch.ones_like(reference_flat[:h]).cumsum(0) - 1
+        grid_x = torch.ones_like(reference_flat[:w]).cumsum(0) - 1
+        grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
         return torch.stack([grid_x/(w-1), grid_y/(h-1)], dim=-1)

@@ -108,3 +108,102 @@ def dynamic_nms_fast_static(boxes, scores, classes, iou_thresholds, active_mask,
 
     keep_sorted = torch.nonzero(keep_indicator).squeeze(1)
     return torch.sort(order.index_select(0, keep_sorted)).values
+
+
+def batched_dynamic_nms_fast_static_mask(boxes, scores, classes, iou_thresholds, active_mask, max_candidates: int):
+    """
+    Export-only batched greedy NMS with a fixed candidate count.
+
+    Returns a dense boolean keep mask in the original candidate order so callers
+    can keep rectangular [B, N, ...] tensors for ONNX/TorchScript export.
+    """
+    offsets = classes.to(boxes.dtype).unsqueeze(-1) * 4.0
+    boxes_offset = boxes + offsets
+    order = scores.argsort(descending=True, dim=1)
+    gather_index = order.unsqueeze(-1).expand(-1, -1, boxes_offset.shape[-1])
+    boxes_sorted = boxes_offset.gather(dim=1, index=gather_index)
+    thresholds_sorted = iou_thresholds.gather(dim=1, index=order)
+    active_sorted = active_mask.gather(dim=1, index=order)
+
+    area = (boxes_sorted[..., 2] - boxes_sorted[..., 0]).clamp(min=0) * (
+        boxes_sorted[..., 3] - boxes_sorted[..., 1]
+    ).clamp(min=0)
+    lt = torch.max(boxes_sorted[:, :, None, :2], boxes_sorted[:, None, :, :2])
+    rb = torch.min(boxes_sorted[:, :, None, 2:], boxes_sorted[:, None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+    union = area[:, :, None] + area[:, None, :] - inter
+    iou_matrix = inter / union
+
+    keep_flags = active_sorted.clone()
+    keep_indicator = torch.zeros_like(active_sorted)
+
+    for i in range(max_candidates):
+        current_keep = keep_flags[:, i]
+        keep_indicator[:, i] = current_keep
+        if i + 1 < max_candidates:
+            suppress = iou_matrix[:, i, (i + 1):] >= thresholds_sorted[:, i].unsqueeze(1)
+            keep_flags[:, (i + 1):] = torch.logical_and(
+                keep_flags[:, (i + 1):],
+                torch.logical_not(torch.logical_and(suppress, current_keep.unsqueeze(1))),
+            )
+
+    keep_mask = torch.zeros_like(active_mask)
+    keep_mask.scatter_(dim=1, index=order, src=keep_indicator)
+    return keep_mask
+
+
+def batched_dynamic_nms_parallel_mask(
+    boxes,
+    scores,
+    classes,
+    iou_thresholds,
+    active_mask,
+):
+    """
+    Vectorized export NMS for eager ExportedProgram execution.
+
+    This uses the Fast NMS approximation: a candidate is suppressed when any
+    higher-scoring active candidate overlaps it above that suppressor's dynamic
+    IoU threshold. Unlike exact greedy NMS, suppressed candidates can still
+    suppress lower-scoring candidates. The approximation avoids the thousands
+    of sequential GPU launches produced by statically unrolling greedy NMS.
+    """
+    offsets = classes.to(boxes.dtype).unsqueeze(-1) * 4.0
+    boxes_offset = boxes + offsets
+    order = scores.argsort(descending=True, dim=1)
+    gather_index = order.unsqueeze(-1).expand(-1, -1, boxes_offset.shape[-1])
+    boxes_sorted = boxes_offset.gather(dim=1, index=gather_index)
+    thresholds_sorted = iou_thresholds.gather(dim=1, index=order)
+    active_sorted = active_mask.gather(dim=1, index=order)
+
+    area = (boxes_sorted[..., 2] - boxes_sorted[..., 0]).clamp(min=0) * (
+        boxes_sorted[..., 3] - boxes_sorted[..., 1]
+    ).clamp(min=0)
+    lt = torch.max(boxes_sorted[:, :, None, :2], boxes_sorted[:, None, :, :2])
+    rb = torch.min(boxes_sorted[:, :, None, 2:], boxes_sorted[:, None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+    union = area[:, :, None] + area[:, None, :] - inter
+    iou_matrix = inter / union
+
+    higher_score_mask = torch.triu(
+        torch.ones_like(iou_matrix, dtype=torch.bool),
+        diagonal=1,
+    )
+    suppression_matrix = torch.logical_and(
+        iou_matrix >= thresholds_sorted.unsqueeze(-1),
+        higher_score_mask,
+    )
+    suppression_matrix = torch.logical_and(
+        suppression_matrix,
+        active_sorted.unsqueeze(-1),
+    )
+    keep_sorted = torch.logical_and(
+        active_sorted,
+        torch.logical_not(suppression_matrix.any(dim=1)),
+    )
+
+    keep_mask = torch.zeros_like(active_mask)
+    keep_mask.scatter_(dim=1, index=order, src=keep_sorted)
+    return keep_mask

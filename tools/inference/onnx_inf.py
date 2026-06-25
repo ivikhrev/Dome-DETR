@@ -47,6 +47,7 @@ def draw(images, labels, boxes, scores, ratios, paddings, thrh=0.4):
         pad_w, pad_h = paddings[i]
 
         for lbl, bb in zip(lab, box):
+            print(bb)
             # Adjust bounding boxes according to the resizing and padding
             bb = [
                 (bb[0] - pad_w) / ratio,
